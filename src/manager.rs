@@ -6,7 +6,7 @@
 use std::{collections::HashMap, net::IpAddr};
 
 use crossfire::{AsyncRx, MAsyncTx, mpmc::unbounded_async};
-use log::debug;
+use log::{debug, info, warn};
 use tokio::sync::{mpsc::UnboundedSender, oneshot::Sender};
 
 use crate::{
@@ -260,7 +260,7 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                     last_interface_index = last_interface_index.wrapping_add(1);
                 }
                 ManagerRequestType::DeferredMuxerAdd { device, response } => {
-                    println!("Adding network device {}", device.serial_number);
+                    info!("event=device_added udid={}", device.serial_number);
                     let attached = attached_plist(&device);
                     devices.insert(device.device_id, device);
                     broadcast(&mut listeners, ListenerEvent::Attached(attached));
@@ -320,12 +320,21 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                 }
                 ManagerRequestType::HeartbeatFailed { udid } => {
                     if let Some(id) = find_device_id(&devices, &udid, "Network") {
+                        let open_socket_count = open_sockets.get(&id).map_or(0, Vec::len);
+                        warn!(
+                            "event=heartbeat_failed udid={udid} device_id={id} action=remove_device_and_stop_streams open_sockets={open_socket_count}"
+                        );
                         drop_entry(id, &mut devices, &mut usb_handles, &mut open_sockets);
                         broadcast(&mut listeners, ListenerEvent::Detached(id));
                     }
                 }
                 ManagerRequestType::OpenSocket { device_id, kill } => {
-                    open_sockets.entry(device_id).or_default().push(kill);
+                    let sockets = open_sockets.entry(device_id).or_default();
+                    sockets.push(kill);
+                    info!(
+                        "event=proxy_socket_opened device_id={device_id} registered_sockets={}",
+                        sockets.len()
+                    );
                 }
                 ManagerRequestType::Subscribe { listener } => {
                     let mut ok = true;

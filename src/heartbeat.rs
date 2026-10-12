@@ -1,6 +1,6 @@
 // Jackson Coxson
 
-use idevice::{Idevice, heartbeat::HeartbeatClient, lockdown::LockdownClient};
+use idevice::{HeartbeatError, Idevice, IdeviceError, heartbeat::HeartbeatClient, lockdown::LockdownClient};
 use log::{debug, info, warn};
 use std::net::SocketAddr;
 use tokio::sync::oneshot::Sender;
@@ -10,13 +10,40 @@ use crate::{
     manager::{ManagerRequest, ManagerSender},
 };
 
+async fn connect_heartbeat(
+    device: &MuxerDevice,
+    pairing_file: &idevice::pairing_file::PairingFile,
+) -> Result<HeartbeatClient, IdeviceError> {
+    let lockdown_socket = SocketAddr::new(
+        device.network_address.unwrap(),
+        LockdownClient::LOCKDOWND_PORT,
+    );
+    let socket = Box::new(tokio::net::TcpStream::connect(lockdown_socket).await?);
+    let idevice = Idevice::new(socket, "netmuxd_heartbeat_reconnect");
+    let mut lockdown_client = LockdownClient { idevice };
+    lockdown_client.start_session(pairing_file).await?;
+
+    let (port, _) = lockdown_client
+        .start_service("com.apple.mobile.heartbeat")
+        .await?;
+    let heartbeat_socket = SocketAddr::new(device.network_address.unwrap(), port);
+    let socket = Box::new(tokio::net::TcpStream::connect(heartbeat_socket).await?);
+    let mut idevice = Idevice::new(socket, "heartbeat_client_reconnect");
+    idevice.start_session(pairing_file, false).await?;
+
+    Ok(HeartbeatClient { idevice })
+}
+
 pub async fn heartbeat(
     device: MuxerDevice,
     response: Option<Sender<plist::Dictionary>>,
     pairing_file: idevice::pairing_file::PairingFile,
     sender: ManagerSender,
 ) {
-    debug!("Spawning heartbeat for {device:?}");
+    debug!(
+        "event=heartbeat_spawn udid={} device={device:?}",
+        device.serial_number
+    );
     tokio::spawn(async move {
         let udid = device.serial_number.clone();
         let socket = SocketAddr::new(
@@ -27,7 +54,9 @@ pub async fn heartbeat(
         let socket = match tokio::net::TcpStream::connect(socket).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to connect to lockdown port: {e:?}");
+                warn!(
+                    "event=heartbeat_setup_failed udid={udid} phase=connect_lockdown error={e:?}"
+                );
                 if let Some(response) = response {
                     response
                         .send(plist_macro::plist!(dict {
@@ -44,7 +73,9 @@ pub async fn heartbeat(
 
         let mut lockdown_client = LockdownClient { idevice };
         if let Err(e) = lockdown_client.start_session(&pairing_file).await {
-            warn!("Failed to start lockdown session: {e:?}");
+            warn!(
+                "event=heartbeat_setup_failed udid={udid} phase=start_lockdown_session error={e:?}"
+            );
             if let Some(response) = response {
                 response
                     .send(plist_macro::plist!(dict {
@@ -61,7 +92,7 @@ pub async fn heartbeat(
         {
             Ok(p) => p,
             Err(e) => {
-                warn!("Failed to start heartbeat service: {e:?}");
+                warn!("event=heartbeat_setup_failed udid={udid} phase=start_service error={e:?}");
                 if let Some(response) = response {
                     response
                         .send(plist_macro::plist!(dict {
@@ -77,7 +108,7 @@ pub async fn heartbeat(
         let socket = match tokio::net::TcpStream::connect(socket).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to connect to heartbeat port: {e:?}");
+                warn!("event=heartbeat_setup_failed udid={udid} phase=connect_service error={e:?}");
                 if let Some(response) = response {
                     response
                         .send(plist_macro::plist!(dict {
@@ -93,7 +124,7 @@ pub async fn heartbeat(
         let mut idevice = Idevice::new(socket, "heartbeat_client");
 
         if let Err(e) = idevice.start_session(&pairing_file, false).await {
-            warn!("Failed to wrap heartbeat client in TLS: {e:?}");
+            warn!("event=heartbeat_setup_failed udid={udid} phase=start_tls error={e:?}");
             if let Some(response) = response {
                 response
                     .send(plist_macro::plist!(dict {
@@ -111,7 +142,7 @@ pub async fn heartbeat(
         sender
             .send(ManagerRequest {
                 request_type: crate::manager::ManagerRequestType::DeferredMuxerAdd {
-                    device,
+                    device: device.clone(),
                     response,
                 },
                 response: None,
@@ -119,13 +150,48 @@ pub async fn heartbeat(
             .await
             .ok();
 
+        info!("event=heartbeat_ready udid={udid} interval_seconds={interval}");
+
         loop {
             match heartbeat_client.get_marco(interval + 5).await {
                 Ok(i) => {
                     interval = i;
                 }
+                Err(IdeviceError::Heartbeat(HeartbeatError::SleepyTime)) => {
+                    info!(
+                        "event=heartbeat_sleep_notification udid={udid} action=send_polo_and_reconnect_keep_device_and_streams"
+                    );
+                    if let Err(e) = heartbeat_client.send_polo().await {
+                        warn!("event=heartbeat_failed udid={udid} phase=send_after_sleep error={e:?}");
+                        sender
+                            .send(ManagerRequest::heartbeat_failed(udid.clone()))
+                            .await
+                            .ok();
+                        break;
+                    }
+                    match connect_heartbeat(&device, &pairing_file).await {
+                        Ok(replacement) => {
+                            heartbeat_client = replacement;
+                            interval = 10;
+                            info!(
+                                "event=heartbeat_reconnected_after_sleep udid={udid} interval_seconds={interval}"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "event=heartbeat_failed udid={udid} phase=reconnect_after_sleep error={e:?}"
+                            );
+                            sender
+                                .send(ManagerRequest::heartbeat_failed(udid.clone()))
+                                .await
+                                .ok();
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 Err(e) => {
-                    info!("Heartbeat recv failed: {:?}", e);
+                    warn!("event=heartbeat_failed udid={udid} phase=recv error={e:?}");
                     sender
                         .send(ManagerRequest::heartbeat_failed(udid.clone()))
                         .await
@@ -134,7 +200,7 @@ pub async fn heartbeat(
                 }
             }
             if let Err(e) = heartbeat_client.send_polo().await {
-                info!("Heartbeat send failed: {:?}", e);
+                warn!("event=heartbeat_failed udid={udid} phase=send error={e:?}");
                 sender
                     .send(ManagerRequest::heartbeat_failed(udid.clone()))
                     .await

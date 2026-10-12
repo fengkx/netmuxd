@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 
-use netmuxd::raw_packet;
+use idevice::usbmuxd::RawPacket;
 
 const SERVICE_NAME: &str = "apple-mobdev2";
 const SERVICE_PROTOCOL: &str = "tcp";
@@ -30,7 +30,7 @@ fn main() {
     request.insert("IPAddress".into(), ip.to_string().into());
     request.insert("DeviceID".into(), udid.as_str().into());
 
-    let request = raw_packet::RawPacket::new(request, 69, 69, 69);
+    let request = RawPacket::new(request, 69, 69, 69);
     let request: Vec<u8> = request.into();
 
     // Connect to the socket
@@ -63,7 +63,7 @@ fn main() {
         buffer.append(&mut packet);
     }
 
-    let parsed: raw_packet::RawPacket = buffer.try_into().unwrap();
+    let parsed: RawPacket = buffer.try_into().unwrap();
     match parsed.plist.get("Result") {
         Some(plist::Value::Integer(r)) => {
             if r.as_unsigned().unwrap() == 1 {

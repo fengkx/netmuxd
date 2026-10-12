@@ -441,7 +441,6 @@ async fn handle_stream(
                             }
                         }
                     } else {
-                        println!("{}", plist_macro::pretty_print_dictionary(&res));
                         RawPacket::new(res, 1, 8, parsed.tag).into()
                     };
                     if let Err(e) = socket.write_all(&out).await {
@@ -692,6 +691,11 @@ async fn handle_stream(
                         }
                     };
 
+                    let udid = lookup.serial_number.clone();
+                    info!(
+                        "event=proxy_connect udid={udid} device_id={device_id} port={port}"
+                    );
+
                     type Upstream = Box<dyn AsyncReadWrite>;
                     let upstream: Result<Upstream, String> = match lookup.connection_type.as_str() {
                         "Network" => match lookup.network_address {
@@ -749,10 +753,10 @@ async fn handle_stream(
 
                     tokio::select! {
                         _ = killed => {
-                            info!("Bidirectional stream stopped via heartbeat failure");
+                            warn!("event=proxy_stream_stopped udid={udid} device_id={device_id} port={port} reason=heartbeat_failed");
                         }
                         e = tokio::io::copy_bidirectional(&mut *upstream, &mut socket) => {
-                            info!("Bidirectional stream stopped: {e:?}");
+                            info!("event=proxy_stream_stopped udid={udid} device_id={device_id} port={port} reason=io_complete result={e:?}");
                         }
                     }
                     return;

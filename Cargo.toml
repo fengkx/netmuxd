@@ -30,6 +30,14 @@ exclude = [
 
 default-run = "netmuxd"
 
+[[bin]]
+name = "passthrough"
+path = "src/passthrough.rs"
+
+[[bin]]
+name = "add_device"
+path = "src/add_device.rs"
+
 [dependencies]
 # Wasm-safe subset always on; native pulls the rest via target deps below.
 tokio = { version = "1", default-features = false, features = [
