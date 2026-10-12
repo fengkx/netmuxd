@@ -47,6 +47,7 @@ pub enum ManagerRequestType {
     DeferredMuxerAdd {
         device: MuxerDevice,
         response: Option<Sender<plist::Dictionary>>,
+        accepted: Sender<bool>,
     },
     RemoveDevice {
         udid: String,
@@ -59,6 +60,7 @@ pub enum ManagerRequestType {
     },
     HeartbeatFailed {
         udid: String,
+        generation: u64,
     },
     OpenSocket {
         device_id: u64,
@@ -100,9 +102,9 @@ impl ManagerRequest {
             response: None,
         }
     }
-    pub fn heartbeat_failed(udid: String) -> Self {
+    pub fn heartbeat_failed(udid: String, generation: u64) -> Self {
         Self {
-            request_type: ManagerRequestType::HeartbeatFailed { udid },
+            request_type: ManagerRequestType::HeartbeatFailed { udid, generation },
             response: None,
         }
     }
@@ -157,6 +159,7 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
     let mut usb_handles: HashMap<u64, UsbMuxHandle> = HashMap::new();
     let mut open_sockets: HashMap<u64, Vec<Sender<()>>> = HashMap::new();
     let mut listeners: Vec<UnboundedSender<ListenerEvent>> = Vec::new();
+    let mut pending = HashMap::<String, (u64, IpAddr)>::new();
     let mut last_index: u64 = if config.upstream.is_some() {
         SHIM_NETWORK_ID_BASE
     } else {
@@ -180,13 +183,25 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                     service_name,
                     connection_type,
                 } => {
-                    if find_device_id(&devices, &udid, &connection_type).is_some() {
+                    let current = find_device_id(&devices, &udid, &connection_type);
+                    if current
+                        .is_some_and(|id| devices[&id].network_address == Some(network_address))
+                    {
+                        reply_add(message.response, true);
+                        continue;
+                    }
+                    if pending
+                        .get(&udid)
+                        .is_some_and(|(_, ip)| *ip == network_address)
+                    {
+                        reply_add(message.response, false);
                         continue;
                     }
                     let pairing_file = match pairing_file_finder.get_pairing_record(&udid).await {
                         Ok(p) => p,
                         Err(e) => {
                             debug!("Failed to get pairing record: {e:?}");
+                            reply_add(message.response, false);
                             continue;
                         }
                     };
@@ -205,18 +220,22 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                     last_index = last_index.wrapping_add(1);
                     last_interface_index = last_interface_index.wrapping_add(1);
 
-                    if config.use_heartbeat {
+                    // Device IDs are monotonic connection generations, including pending probes.
+                    pending.insert(udid, (device.device_id, network_address));
+                    if config.use_heartbeat || current.is_some() {
                         heartbeat(
                             device,
                             message.response,
                             pairing_file,
                             manager_sender.clone(),
+                            config.use_heartbeat,
                         )
                         .await;
 
                         continue;
                     }
 
+                    pending.remove(&device.serial_number);
                     let attached = attached_plist(&device);
                     devices.insert(device.device_id, device);
                     broadcast(&mut listeners, ListenerEvent::Attached(attached));
@@ -259,23 +278,29 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                     last_index = last_index.wrapping_add(1);
                     last_interface_index = last_interface_index.wrapping_add(1);
                 }
-                ManagerRequestType::DeferredMuxerAdd { device, response } => {
-                    info!("event=device_added udid={}", device.serial_number);
-                    let attached = attached_plist(&device);
-                    devices.insert(device.device_id, device);
-                    broadcast(&mut listeners, ListenerEvent::Attached(attached));
-                    if let Some(response) = response {
-                        response
-                            .send(plist_macro::plist!(dict {
-                            "Result": 1,
-                            }))
-                            .ok();
-                    }
+                ManagerRequestType::DeferredMuxerAdd {
+                    device,
+                    response,
+                    accepted,
+                } => {
+                    let published = complete_network_device(
+                        device,
+                        &mut pending,
+                        &mut devices,
+                        &mut usb_handles,
+                        &mut open_sockets,
+                        &mut listeners,
+                    );
+                    reply_add(response, published);
+                    let _ = accepted.send(published);
                 }
                 ManagerRequestType::RemoveDevice {
                     udid,
                     connection_type,
                 } => {
+                    if connection_type.as_deref().is_none_or(|ct| ct == "Network") {
+                        pending.remove(&udid);
+                    }
                     let ids: Vec<u64> = devices
                         .iter()
                         .filter(|(_, d)| {
@@ -318,15 +343,16 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
                     });
                     let _ = response.send(lookup);
                 }
-                ManagerRequestType::HeartbeatFailed { udid } => {
-                    if let Some(id) = find_device_id(&devices, &udid, "Network") {
-                        let open_socket_count = open_sockets.get(&id).map_or(0, Vec::len);
-                        warn!(
-                            "event=heartbeat_failed udid={udid} device_id={id} action=remove_device_and_stop_streams open_sockets={open_socket_count}"
-                        );
-                        drop_entry(id, &mut devices, &mut usb_handles, &mut open_sockets);
-                        broadcast(&mut listeners, ListenerEvent::Detached(id));
-                    }
+                ManagerRequestType::HeartbeatFailed { udid, generation } => {
+                    fail_network_device(
+                        &udid,
+                        generation,
+                        &mut pending,
+                        &mut devices,
+                        &mut usb_handles,
+                        &mut open_sockets,
+                        &mut listeners,
+                    );
                 }
                 ManagerRequestType::OpenSocket { device_id, kill } => {
                     let sockets = open_sockets.entry(device_id).or_default();
@@ -361,4 +387,186 @@ pub fn new_manager_thread(config: &NetmuxdConfig) -> ManagerSender {
 fn new_channel_pair() -> (ManagerSender, ManagerReceiver) {
     let (t, r) = unbounded_async();
     (t.into(), r.into())
+}
+
+fn reply_add(response: Option<Sender<plist::Dictionary>>, success: bool) {
+    if let Some(response) = response {
+        let _ = response
+            .send(plist_macro::plist!(dict { "Result": if success { 1u64 } else { 0u64 } }));
+    }
+}
+
+// Only the latest validated candidate may replace the active connection.
+fn complete_network_device(
+    device: MuxerDevice,
+    pending: &mut HashMap<String, (u64, IpAddr)>,
+    devices: &mut HashMap<u64, MuxerDevice>,
+    usb_handles: &mut HashMap<u64, UsbMuxHandle>,
+    open_sockets: &mut HashMap<u64, Vec<Sender<()>>>,
+    listeners: &mut Vec<UnboundedSender<ListenerEvent>>,
+) -> bool {
+    if pending.get(&device.serial_number).map(|p| p.0) != Some(device.device_id) {
+        return false;
+    }
+    pending.remove(&device.serial_number);
+    if let Some(id) = find_device_id(devices, &device.serial_number, &device.connection_type) {
+        drop_entry(id, devices, usb_handles, open_sockets);
+        broadcast(listeners, ListenerEvent::Detached(id));
+    }
+    info!(
+        "event=device_added udid={} generation={} address={:?}",
+        device.serial_number, device.device_id, device.network_address
+    );
+    let attached = attached_plist(&device);
+    devices.insert(device.device_id, device);
+    broadcast(listeners, ListenerEvent::Attached(attached));
+    true
+}
+
+fn fail_network_device(
+    udid: &str,
+    generation: u64,
+    pending: &mut HashMap<String, (u64, IpAddr)>,
+    devices: &mut HashMap<u64, MuxerDevice>,
+    usb_handles: &mut HashMap<u64, UsbMuxHandle>,
+    open_sockets: &mut HashMap<u64, Vec<Sender<()>>>,
+    listeners: &mut Vec<UnboundedSender<ListenerEvent>>,
+) {
+    if pending.get(udid).map(|p| p.0) == Some(generation) {
+        pending.remove(udid);
+    }
+    if let Some(id) = find_device_id(devices, udid, "Network")
+        && id == generation
+    {
+        let open_socket_count = open_sockets.get(&id).map_or(0, Vec::len);
+        warn!(
+            "event=heartbeat_failed udid={udid} generation={generation} action=remove_device_and_stop_streams open_sockets={open_socket_count}"
+        );
+        drop_entry(id, devices, usb_handles, open_sockets);
+        broadcast(listeners, ListenerEvent::Detached(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Registry {
+        pending: HashMap<String, (u64, IpAddr)>,
+        devices: HashMap<u64, MuxerDevice>,
+        usb: HashMap<u64, UsbMuxHandle>,
+        sockets: HashMap<u64, Vec<Sender<()>>>,
+        listeners: Vec<UnboundedSender<ListenerEvent>>,
+    }
+
+    impl Registry {
+        fn candidate(&mut self, generation: u64, ip: &str) -> MuxerDevice {
+            let ip = ip.parse().unwrap();
+            self.pending.insert("phone".into(), (generation, ip));
+            MuxerDevice {
+                connection_type: "Network".into(),
+                device_id: generation,
+                interface_index: generation,
+                serial_number: "phone".into(),
+                network_address: Some(ip),
+                service_name: Some("_apple-mobdev2._tcp.local".into()),
+                connection_speed: None,
+                location_id: None,
+                product_id: None,
+            }
+        }
+
+        fn complete(&mut self, device: MuxerDevice) -> bool {
+            complete_network_device(
+                device,
+                &mut self.pending,
+                &mut self.devices,
+                &mut self.usb,
+                &mut self.sockets,
+                &mut self.listeners,
+            )
+        }
+
+        fn fail(&mut self, generation: u64) {
+            fail_network_device(
+                "phone",
+                generation,
+                &mut self.pending,
+                &mut self.devices,
+                &mut self.usb,
+                &mut self.sockets,
+                &mut self.listeners,
+            );
+        }
+    }
+
+    #[test]
+    fn dhcp_change_after_leaving_home() {
+        let mut registry = Registry::default();
+        let old = registry.candidate(1, "192.168.2.135");
+        assert!(registry.complete(old.clone()));
+        registry.fail(1);
+        assert!(registry.devices.is_empty());
+        let new = registry.candidate(2, "192.168.2.134");
+        assert!(registry.complete(new));
+        registry.fail(1);
+        assert!(!registry.complete(old));
+        assert_eq!(registry.devices.len(), 1);
+        assert_eq!(
+            registry.devices[&2].network_address,
+            Some("192.168.2.134".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn replacement_waits_for_validation_and_detaches_old_streams() {
+        let mut registry = Registry::default();
+        let old = registry.candidate(1, "192.168.2.135");
+        assert!(registry.complete(old));
+        let (kill, mut killed) = tokio::sync::oneshot::channel();
+        registry.sockets.insert(1, vec![kill]);
+        let (listener, mut events) = tokio::sync::mpsc::unbounded_channel();
+        registry.listeners.push(listener);
+        let new = registry.candidate(2, "192.168.2.134");
+        assert!(registry.devices.contains_key(&1));
+        assert!(events.try_recv().is_err());
+        assert!(killed.try_recv().is_err());
+        assert!(registry.complete(new));
+        assert_eq!(killed.try_recv(), Ok(()));
+        assert!(matches!(events.try_recv(), Ok(ListenerEvent::Detached(1))));
+        assert!(matches!(events.try_recv(), Ok(ListenerEvent::Attached(_))));
+        registry.fail(1);
+        assert!(registry.devices.contains_key(&2));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_candidate_preserves_working_connection_and_can_retry() {
+        let mut registry = Registry::default();
+        let old = registry.candidate(1, "192.168.2.135");
+        assert!(registry.complete(old));
+        let failed = registry.candidate(2, "192.168.2.134");
+        registry.fail(2);
+        assert!(registry.devices.contains_key(&1));
+        assert!(registry.pending.is_empty());
+        assert!(!registry.complete(failed));
+        let retry = registry.candidate(3, "192.168.2.134");
+        assert!(registry.complete(retry));
+        registry.fail(2);
+        assert!(registry.devices.contains_key(&3));
+    }
+
+    #[test]
+    fn out_of_order_validation_cannot_overwrite_newer_candidate() {
+        let mut registry = Registry::default();
+        let old = registry.candidate(1, "192.168.2.135");
+        let new = registry.candidate(2, "192.168.2.134");
+        assert!(!registry.complete(old.clone()));
+        registry.fail(1);
+        assert!(registry.complete(new));
+        assert!(!registry.complete(old));
+        registry.fail(2);
+        assert!(registry.devices.is_empty());
+    }
 }
